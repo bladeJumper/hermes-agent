@@ -101,6 +101,8 @@ try:
         ReplyMessageRequestBody,
         UpdateMessageRequest,
         UpdateMessageRequestBody,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
     )
     from lark_oapi.core import AccessTokenType, HttpMethod
     from lark_oapi.core.const import FEISHU_DOMAIN, LARK_DOMAIN
@@ -1816,7 +1818,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
 
             card = {
-                "config": {"wide_screen_mode": True},
+                "config": {"wide_screen_mode": True, "update_multi": True},
                 "header": {
                     "title": {"content": "⚠️ Command Approval Required", "tag": "plain_text"},
                     "template": "orange",
@@ -1875,7 +1877,7 @@ class FeishuAdapter(BasePlatformAdapter):
             }
 
         return {
-            "config": {"wide_screen_mode": True},
+            "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "title": {"content": "⚕ Update Needs Your Input", "tag": "plain_text"},
                 "template": "orange",
@@ -1933,7 +1935,7 @@ class FeishuAdapter(BasePlatformAdapter):
         icon = "❌" if choice == "deny" else "✅"
         label = _APPROVAL_LABEL_MAP.get(choice, "Resolved")
         return {
-            "config": {"wide_screen_mode": True},
+            "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "title": {"content": f"{icon} {label}", "tag": "plain_text"},
                 "template": "red" if choice == "deny" else "green",
@@ -1951,7 +1953,7 @@ class FeishuAdapter(BasePlatformAdapter):
         yes = answer == "y"
         label = "Yes" if yes else "No"
         return {
-            "config": {"wide_screen_mode": True},
+            "config": {"wide_screen_mode": True, "update_multi": True},
             "header": {
                 "title": {"content": f"{'✅' if yes else '❌'} Update prompt answered: {label}", "tag": "plain_text"},
                 "template": "green" if yes else "red",
@@ -2571,11 +2573,27 @@ class FeishuAdapter(BasePlatformAdapter):
         return response
 
     async def _resolve_approval(self, approval_id: Any, choice: str, user_name: str) -> None:
-        """Pop approval state and unblock the waiting agent thread."""
+        """Pop approval state, patch the card to resolved state, and unblock the waiting agent thread."""
         state = self._approval_state.pop(approval_id, None)
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return
+
+        # Patch the interactive card to its resolved state via the API.
+        # The synchronous CallBackCard response already updates the card for
+        # the clicking user, but the PATCH API ensures all other clients
+        # (mobile, desktop, other sessions) also see the resolved state.
+        message_id = state.get("message_id", "")
+        if message_id:
+            try:
+                resolved_card = self._build_resolved_approval_card(choice=choice, user_name=user_name)
+                card_json = json.dumps(resolved_card, ensure_ascii=False)
+                result = await self.patch_message(message_id=message_id, card_content=card_json)
+                if not result.success:
+                    logger.warning("[Feishu] Failed to patch approval card %s: %s", message_id, result.error)
+            except Exception as exc:
+                logger.warning("[Feishu] Exception patching approval card %s: %s", message_id, exc)
+
         try:
             from tools.approval import resolve_gateway_approval
             count = resolve_gateway_approval(state["session_key"], choice)
@@ -4581,6 +4599,55 @@ class FeishuAdapter(BasePlatformAdapter):
                 .build()
             )
         return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        if "PatchMessageRequestBody" in globals():
+            return (
+                PatchMessageRequestBody.builder()
+                .content(content)
+                .build()
+            )
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if "PatchMessageRequest" in globals():
+            return (
+                PatchMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    async def patch_message(
+        self,
+        message_id: str,
+        card_content: str,
+    ) -> SendResult:
+        """Patch an interactive card message using im.v1.message.patch.
+
+        Unlike ``edit_message`` which uses the PUT-based ``message.update``
+        API (silently ignored for interactive cards), this uses the PATCH
+        endpoint that is specifically designed for updating card messages.
+
+        The original card must have been sent with ``"update_multi": True``
+        in its config for the patch API to work.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            body = self._build_patch_message_body(content=card_content)
+            request = self._build_patch_message_request(message_id=message_id, request_body=body)
+            response = await asyncio.to_thread(self._client.im.v1.message.patch, request)
+            result = self._finalize_send_result(response, "patch failed")
+            if result.success:
+                result.message_id = message_id
+            return result
+        except Exception as exc:
+            logger.error("[Feishu] Failed to patch message %s: %s", message_id, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
 
     @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:
